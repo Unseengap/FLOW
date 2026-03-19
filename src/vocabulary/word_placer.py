@@ -316,6 +316,8 @@ class WordPlacer:
 
         Optimization: temperature is saved/restored once for the entire
         batch instead of per-word (50K save/restore cycles eliminated).
+        Uses manifold.place_fast() to skip per-word density/curvature
+        recomputation, then flushes once at the end.
 
         Parameters
         ----------
@@ -326,18 +328,22 @@ class WordPlacer:
         if freq_ranks is None:
             freq_ranks = list(range(1, len(words) + 1))
 
+        manifold = self._engine._manifold
         labels: list[str] = []
         self._set_cold()
         try:
             for i, (w, r) in enumerate(zip(words, freq_ranks)):
                 vec   = structural_feature_vector(w, r)
                 label = f"vocab::{w}"
-                result = self._engine.process(
-                    Experience(vector=vec, label=label, source="vocabulary_geometry")
-                )
-                labels.append(result.placed_label or label)
+                # Fast placement: skip per-word density/curvature recompute
+                manifold.place_fast(label, vec, origin="vocabulary_geometry")
+                labels.append(label)
+                # Tick the temperature schedule to match process() semantics
+                self._engine._schedule.step()
                 if progress_callback is not None and (i + 1) % 1000 == 0:
                     progress_callback(i + 1, len(words), label)
+            # Rebuild tree + recompute densities in one pass
+            manifold.flush_batch(labels)
         finally:
             self._restore_temperature()
 
@@ -350,7 +356,7 @@ class WordPlacer:
         """GPU-accelerated batch placement.
 
         Pre-computes all 50K structural vectors on GPU (cupy) in a single
-        batch, then places sequentially on the manifold.  Falls back to
+        batch, then places via fast path on the manifold.  Falls back to
         place_batch() if cupy is unavailable.
         """
         try:
@@ -364,17 +370,20 @@ class WordPlacer:
         # Batch-compute all structural vectors on GPU
         vecs = batch_structural_vectors_gpu(words, freq_ranks)
 
+        manifold = self._engine._manifold
         labels: list[str] = []
         self._set_cold()
         try:
             for i, (w, vec) in enumerate(zip(words, vecs)):
                 label = f"vocab::{w}"
-                result = self._engine.process(
-                    Experience(vector=vec, label=label, source="vocabulary_geometry")
-                )
-                labels.append(result.placed_label or label)
+                # Fast placement: skip per-word density/curvature recompute
+                manifold.place_fast(label, vec, origin="vocabulary_geometry")
+                labels.append(label)
+                self._engine._schedule.step()
                 if progress_callback is not None and (i + 1) % 1000 == 0:
                     progress_callback(i + 1, len(words), label)
+            # Rebuild tree + recompute densities in one pass
+            manifold.flush_batch(labels)
         finally:
             self._restore_temperature()
 

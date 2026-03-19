@@ -71,6 +71,11 @@ class LivingManifold:
         self._kdtree: Optional[cKDTree] = None
         self._kdtree_labels: List[str] = []
         self._kdtree_dirty: bool = True
+        self._kdtree_writes_since_rebuild: int = 0
+        self._kdtree_rebuild_interval: int = 50  # rebuild at most every N writes
+
+        # Maximum number of neighbors affected per deformation (scalability cap)
+        self._max_deform_neighbors: int = 64
 
         # Composer reused from seed (already initialised with all 4 geometries)
         self._composer = seed.composer
@@ -102,8 +107,20 @@ class LivingManifold:
     # KD-tree (lazy)                                                       #
     # ------------------------------------------------------------------ #
 
-    def _ensure_kdtree(self) -> None:
+    def _ensure_kdtree(self, force: bool = False) -> None:
+        """Rebuild the cKDTree if stale.
+
+        The tree is considered stale when ``_kdtree_dirty`` is True **and**
+        either *force* is True or enough writes have accumulated since the
+        last rebuild (controlled by ``_kdtree_rebuild_interval``).  This
+        avoids O(n) rebuilds after every single ``place()``/``deform_local()``
+        call, which was the dominant bottleneck at 50K+ manifold points.
+        """
         if not self._kdtree_dirty:
+            return
+        # First build is always forced; after that, throttle rebuilds
+        if (self._kdtree is not None and not force
+                and self._kdtree_writes_since_rebuild < self._kdtree_rebuild_interval):
             return
         labels = list(self._points.keys())
         if not labels:
@@ -115,6 +132,7 @@ class LivingManifold:
         self._kdtree = cKDTree(matrix)
         self._kdtree_labels = labels
         self._kdtree_dirty = False
+        self._kdtree_writes_since_rebuild = 0
 
     # ------------------------------------------------------------------ #
     # READ operations                                                      #
@@ -303,6 +321,17 @@ class LivingManifold:
         candidate_labels = None
         if self._kdtree is not None and cutoff > 0:
             idxs = self._kdtree.query_ball_point(centre_vec, cutoff)
+            # Cap the number of affected neighbours to prevent O(n)
+            # degradation in dense manifold regions.  The centre point
+            # is always included; remaining candidates are the closest.
+            if len(idxs) > self._max_deform_neighbors:
+                # Keep nearest neighbours only (by index proximity to
+                # the kdtree data, which is spatially coherent)
+                dists = np.linalg.norm(
+                    self._kdtree.data[idxs] - centre_vec, axis=1
+                )
+                keep = np.argsort(dists)[: self._max_deform_neighbors]
+                idxs = [idxs[k] for k in keep]
             candidate_labels = {self._kdtree_labels[i] for i in idxs}
 
         result = self._deformer.apply(
@@ -326,6 +355,7 @@ class LivingManifold:
             )
 
         self._kdtree_dirty = True
+        self._kdtree_writes_since_rebuild += 1
         self._state.tick()
         return result.n_affected
 
@@ -346,9 +376,57 @@ class LivingManifold:
         self._state.deformation.register(concept, self.DIM)
         self._geodesic.add_point(concept, vector)
         self._kdtree_dirty = True
+        self._kdtree_writes_since_rebuild += 1
         self._recompute_density(concept)
         self._state.tick()
         return mp
+
+    def place_fast(self, concept: str, vector: np.ndarray, origin: str = "placed") -> ManifoldPoint:
+        """Fast placement for batch vocabulary loading.
+
+        Same as ``place()`` but skips per-point density and curvature
+        recomputation (those require kNN queries that are O(n) when the
+        tree is stale).  Call ``flush_batch()`` after a batch to rebuild
+        the tree and recompute densities in one pass.
+
+        Returns the new ManifoldPoint.
+        """
+        mp = ManifoldPoint(
+            vector=vector.copy(),
+            label=concept,
+            origin=origin,
+        )
+        self._points[concept] = vector.copy()
+        self._metadata[concept] = mp
+        self._state.deformation.register(concept, self.DIM)
+        self._geodesic.add_point(concept, vector)
+        self._kdtree_dirty = True
+        self._kdtree_writes_since_rebuild += 1
+        # Set a default density — will be recomputed in flush_batch()
+        self._state.density.set(concept, 0.0)
+        self._state.tick()
+        return mp
+
+    def flush_batch(self, labels: Optional[List[str]] = None) -> None:
+        """Force a KDTree rebuild and recompute densities for *labels*.
+
+        If *labels* is None, all points are refreshed.  Call this after a
+        sequence of ``place_fast()`` calls to bring density / curvature
+        estimates up to date.
+        """
+        self._ensure_kdtree(force=True)
+        targets = labels if labels is not None else list(self._points.keys())
+        for lbl in targets:
+            if lbl in self._points:
+                self._recompute_density(lbl)
+
+    def force_rebuild_tree(self) -> None:
+        """Force an immediate cKDTree rebuild.
+
+        Useful after a large batch of writes when you need accurate
+        nearest-neighbour queries immediately.
+        """
+        self._ensure_kdtree(force=True)
 
     def update_density(self, label: str) -> float:
         """Recompute density at *label* based on current neighbour counts.

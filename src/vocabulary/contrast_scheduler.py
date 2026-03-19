@@ -162,6 +162,9 @@ class ContrastScheduler:
         if batch:
             n_applied += self._flush_batch(batch)
 
+        # Rebuild tree after all contrast judgments before causal phase
+        manifold.force_rebuild_tree()
+
         if progress_callback is not None:
             progress_callback(n_applied, n_total_pairs, "contrast_done")
 
@@ -183,14 +186,20 @@ class ContrastScheduler:
         the first pass, changing their relative positions, so subsequent
         passes re-apply the same PMI evidence against the updated geometry.
 
+        Between passes the KDTree is rebuilt and densities are refreshed
+        so each pass operates on accurate spatial queries.
+
         Returns
         -------
         int — total judgments applied across all passes.
         """
+        manifold = self._engine._manifold
         total = 0
         for p in range(n_passes):
             pass_result = self.run(matrix, progress_callback=progress_callback)
             total += pass_result
+            # Force KDTree rebuild + density refresh between passes
+            manifold.force_rebuild_tree()
             if progress_callback is not None:
                 progress_callback(total, -1, f"pass_{p+1}_done")
         return total
@@ -203,18 +212,11 @@ class ContrastScheduler:
         n = 0
         for cp in batch:
             try:
-                self._engine.judge(cp.label_a, cp.label_b, cp.judgment, cp.strength)
-                n += 1
+                n += self._engine.judge_fast(
+                    cp.label_a, cp.label_b, cp.judgment, cp.strength
+                )
             except (KeyError, ValueError):
                 # Word was removed from manifold or invalid — skip
-                continue
-
-        # Density refresh after each batch (locality maintenance)
-        for cp in batch[:min(len(batch), 32)]:  # Sample; full refresh too slow
-            try:
-                manifold.update_density(cp.label_a)
-                manifold.update_density(cp.label_b)
-            except (KeyError, ValueError):
                 continue
 
         return n

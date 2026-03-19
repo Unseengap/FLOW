@@ -200,6 +200,40 @@ class ContrastEngine:
             for p in pairs
         ]
 
+    def judge_fast(
+        self,
+        label_a: str,
+        label_b: str,
+        judgment: JudgmentType,
+        strength: float = 1.0,
+    ) -> int:
+        """Lightweight contrast judgment — skips density updates & persistence.
+
+        Applies the same displacement logic as ``judge()`` but omits the
+        per-pair density recomputation, persistence diagram recording, and
+        structural-correction checks.  Callers should call
+        ``manifold.force_rebuild_tree()`` and refresh densities in bulk
+        after processing a large batch of fast judgments.
+
+        Returns
+        -------
+        int — 1 if applied, 0 if skipped (coincident points).
+        """
+        pa = self._manifold.position(label_a)
+        pb = self._manifold.position(label_b)
+
+        delta_a, delta_b = self._compute_displacements(pa, pb, judgment, strength)
+
+        # Skip if both deltas are zero (coincident points with SAME judgment)
+        if np.dot(delta_a, delta_a) < 1e-24 and np.dot(delta_b, delta_b) < 1e-24:
+            return 0
+
+        self._manifold.deform_local(label_a, delta_a)
+        self._manifold.deform_local(label_b, delta_b)
+
+        self._n_judgments += 1
+        return 1
+
     # ------------------------------------------------------------------ #
     # Displacement computation                                             #
     # ------------------------------------------------------------------ #
