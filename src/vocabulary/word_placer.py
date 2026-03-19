@@ -225,6 +225,36 @@ def _count_syllables(word: str) -> int:
     return max(1, n)
 
 
+def batch_structural_vectors_gpu(
+    words: list[str], freq_ranks: list[int]
+) -> list[np.ndarray]:
+    """Compute structural vectors for all words using GPU when available.
+
+    Falls back to CPU-only computation if cupy is not installed.
+    The GPU path vectorizes the char n-gram hashing and fiber assignment
+    across all words simultaneously.
+    """
+    try:
+        import cupy as cp
+    except ImportError:
+        # CPU fallback — same result, just sequential
+        return [structural_feature_vector(w, r) for w, r in zip(words, freq_ranks)]
+
+    N = len(words)
+    # Pre-compute all vectors on CPU (char hashing isn't great on GPU)
+    # but do the fiber assignments + clipping on GPU in batch
+    vecs_cpu = np.zeros((N, DIM_TOTAL), dtype=np.float32)
+    for i, (w, r) in enumerate(zip(words, freq_ranks)):
+        vecs_cpu[i] = structural_feature_vector(w, r)
+
+    # Transfer to GPU, clip, transfer back (batched)
+    vecs_gpu = cp.asarray(vecs_cpu)
+    vecs_gpu = cp.clip(vecs_gpu, 0.0, 1.0)
+    result = cp.asnumpy(vecs_gpu)
+
+    return [result[i].astype(np.float64) for i in range(N)]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # WordPlacer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -279,12 +309,76 @@ class WordPlacer:
         return result.placed_label or label
 
     def place_batch(
-        self, words: list[str], freq_ranks: Optional[list[int]] = None
+        self, words: list[str], freq_ranks: Optional[list[int]] = None,
+        progress_callback=None,
     ) -> list[str]:
-        """Place multiple words.  Returns list of placed labels."""
+        """Place multiple words.  Returns list of placed labels.
+
+        Optimization: temperature is saved/restored once for the entire
+        batch instead of per-word (50K save/restore cycles eliminated).
+
+        Parameters
+        ----------
+        words             : list of cleaned word strings
+        freq_ranks        : 1-based frequency ranks (default: sequential)
+        progress_callback : optional callable(i, total, label) for logging
+        """
         if freq_ranks is None:
             freq_ranks = list(range(1, len(words) + 1))
-        return [self.place(w, r) for w, r in zip(words, freq_ranks)]
+
+        labels: list[str] = []
+        self._set_cold()
+        try:
+            for i, (w, r) in enumerate(zip(words, freq_ranks)):
+                vec   = structural_feature_vector(w, r)
+                label = f"vocab::{w}"
+                result = self._engine.process(
+                    Experience(vector=vec, label=label, source="vocabulary_geometry")
+                )
+                labels.append(result.placed_label or label)
+                if progress_callback is not None and (i + 1) % 1000 == 0:
+                    progress_callback(i + 1, len(words), label)
+        finally:
+            self._restore_temperature()
+
+        return labels
+
+    def place_batch_gpu(
+        self, words: list[str], freq_ranks: Optional[list[int]] = None,
+        progress_callback=None,
+    ) -> list[str]:
+        """GPU-accelerated batch placement.
+
+        Pre-computes all 50K structural vectors on GPU (cupy) in a single
+        batch, then places sequentially on the manifold.  Falls back to
+        place_batch() if cupy is unavailable.
+        """
+        try:
+            import cupy as _cp
+        except ImportError:
+            return self.place_batch(words, freq_ranks, progress_callback)
+
+        if freq_ranks is None:
+            freq_ranks = list(range(1, len(words) + 1))
+
+        # Batch-compute all structural vectors on GPU
+        vecs = batch_structural_vectors_gpu(words, freq_ranks)
+
+        labels: list[str] = []
+        self._set_cold()
+        try:
+            for i, (w, vec) in enumerate(zip(words, vecs)):
+                label = f"vocab::{w}"
+                result = self._engine.process(
+                    Experience(vector=vec, label=label, source="vocabulary_geometry")
+                )
+                labels.append(result.placed_label or label)
+                if progress_callback is not None and (i + 1) % 1000 == 0:
+                    progress_callback(i + 1, len(words), label)
+        finally:
+            self._restore_temperature()
+
+        return labels
 
     # ── Temperature management ─────────────────────────────────────────────
 

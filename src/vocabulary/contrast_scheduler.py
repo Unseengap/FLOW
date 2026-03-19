@@ -112,7 +112,7 @@ class ContrastScheduler:
 
     # ── Public API ─────────────────────────────────────────────────────────
 
-    def run(self, matrix: CoOccurrenceMatrix) -> int:
+    def run(self, matrix: CoOccurrenceMatrix, progress_callback=None) -> int:
         """Apply all contrast judgments derived from *matrix*.
 
         Only words that are already on the manifold (reachable via
@@ -121,8 +121,8 @@ class ContrastScheduler:
 
         Parameters
         ----------
-        matrix : CoOccurrenceMatrix
-            Result of CoOccurrenceCounter.build().
+        matrix            : CoOccurrenceMatrix
+        progress_callback : optional callable(n_applied, n_total_pairs, phase_str)
 
         Returns
         -------
@@ -132,17 +132,21 @@ class ContrastScheduler:
         pmi_max  = matrix.pmi_max()
         n_applied = 0
 
+        # Pre-build label set for O(1) membership checks (vs per-pair try/except)
+        manifold_labels = set(manifold.labels)
+
         # ── Phase 1: Symmetric SAME / DIFFERENT judgments ─────────────────
         pairs = matrix.pairs_above_threshold(self.tau_same, self.tau_diff)
+        n_total_pairs = len(pairs)
         batch: List[ContrastPair] = []
 
-        for w1, w2, pmi_val in pairs:
+        for idx, (w1, w2, pmi_val) in enumerate(pairs):
             la = f"vocab::{w1}"
             lb = f"vocab::{w2}"
 
-            if not self._on_manifold(manifold, la):
+            if la not in manifold_labels:
                 continue
-            if not self._on_manifold(manifold, lb):
+            if lb not in manifold_labels:
                 continue
 
             j = JudgmentType.SAME if pmi_val > self.tau_same else JudgmentType.DIFFERENT
@@ -152,17 +156,27 @@ class ContrastScheduler:
             if len(batch) >= self.batch_size:
                 n_applied += self._flush_batch(batch)
                 batch = []
+                if progress_callback is not None:
+                    progress_callback(n_applied, n_total_pairs, "contrast")
 
         if batch:
             n_applied += self._flush_batch(batch)
 
+        if progress_callback is not None:
+            progress_callback(n_applied, n_total_pairs, "contrast_done")
+
         # ── Phase 2: Directed causal fiber bias ───────────────────────────
         directed = matrix.directed_pairs_above_delta(self.delta_causal)
-        n_applied += self._apply_causal_bias(directed, manifold)
+        n_causal = self._apply_causal_bias(directed, manifold, manifold_labels)
+        n_applied += n_causal
+
+        if progress_callback is not None:
+            progress_callback(n_applied, n_total_pairs, "causal_done")
 
         return n_applied
 
-    def run_passes(self, matrix: CoOccurrenceMatrix, n_passes: int = 3) -> int:
+    def run_passes(self, matrix: CoOccurrenceMatrix, n_passes: int = 3,
+                   progress_callback=None) -> int:
         """Run the full contrast pass *n_passes* times.
 
         Multiple passes allow the geometry to converge: words shift after
@@ -174,8 +188,11 @@ class ContrastScheduler:
         int — total judgments applied across all passes.
         """
         total = 0
-        for _ in range(n_passes):
-            total += self.run(matrix)
+        for p in range(n_passes):
+            pass_result = self.run(matrix, progress_callback=progress_callback)
+            total += pass_result
+            if progress_callback is not None:
+                progress_callback(total, -1, f"pass_{p+1}_done")
         return total
 
     # ── Helpers ────────────────────────────────────────────────────────────
@@ -206,6 +223,7 @@ class ContrastScheduler:
         self,
         directed: List[Tuple[str, str, float]],
         manifold,
+        manifold_labels = None,
     ) -> int:
         """Nudge word pairs along the causal fiber (dims 64–79).
 
@@ -217,14 +235,16 @@ class ContrastScheduler:
         geometry emerges from the accumulation of many such nudges.
         """
         n = 0
+        if manifold_labels is None:
+            manifold_labels = set(manifold.labels)
         # Causal displacement: dims 64–79 only
         CAUSAL_DIM = 16   # 80 - 64
         for w1, w2, dpmi_diff in directed:
             la = f"vocab::{w1}"
             lb = f"vocab::{w2}"
-            if not self._on_manifold(manifold, la):
+            if la not in manifold_labels:
                 continue
-            if not self._on_manifold(manifold, lb):
+            if lb not in manifold_labels:
                 continue
 
             # Build a displacement that only affects causal fiber

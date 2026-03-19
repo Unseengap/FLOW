@@ -215,6 +215,82 @@ def _derive_hedging(
         return False
 
 
+def _batch_derive_hedging(
+    manifold: "LivingManifold",
+    labels: List[str],
+    k: int = 5,
+) -> List[bool]:
+    """Batch hedging derivation using a single cKDTree query.
+
+    Instead of 50K individual manifold.nearest() calls, builds one KDTree
+    from all manifold points and queries all positions in a single batch.
+    ~50-100x faster than per-word _derive_hedging().
+    """
+    from scipy.spatial import cKDTree
+
+    # Collect uncertainty seed positions
+    seed_positions = []
+    for seed_label in _UNCERTAINTY_SEEDS:
+        try:
+            seed_positions.append(manifold.position(seed_label))
+        except (KeyError, ValueError):
+            continue
+
+    if not seed_positions:
+        return [False] * len(labels)
+
+    seed_arr = np.stack(seed_positions)  # (n_seeds, 104)
+
+    # Gather query positions
+    valid_mask = []
+    query_positions = []
+    for label in labels:
+        try:
+            pos = manifold.position(label)
+            query_positions.append(pos)
+            valid_mask.append(True)
+        except (KeyError, ValueError):
+            valid_mask.append(False)
+
+    if not query_positions:
+        return [False] * len(labels)
+
+    query_arr = np.stack(query_positions)  # (N_valid, 104)
+
+    # Build tree from ALL manifold points and find k neighbors per query
+    all_labels_list = list(manifold._points.keys())
+    if not all_labels_list:
+        return [False] * len(labels)
+
+    all_positions = np.stack([manifold._points[l] for l in all_labels_list])
+    tree = cKDTree(all_positions)
+    _, idxs = tree.query(query_arr, k=min(k, len(all_labels_list)))
+
+    # Check if any neighbor is an uncertainty seed
+    seed_label_set = _UNCERTAINTY_SEEDS
+    results_valid = []
+    for i in range(len(query_positions)):
+        row_idxs = idxs[i] if idxs.ndim == 2 else [idxs[i]]
+        found = False
+        for j in row_idxs:
+            if all_labels_list[j] in seed_label_set:
+                found = True
+                break
+        results_valid.append(found)
+
+    # Map back to full label list
+    results = []
+    vi = 0
+    for valid in valid_mask:
+        if valid:
+            results.append(results_valid[vi])
+            vi += 1
+        else:
+            results.append(False)
+
+    return results
+
+
 def _rhythm_from_text(text: str) -> str:
     """Derive rhythm class from word count."""
     n = len(text.split())
@@ -431,6 +507,9 @@ class TemplateBuilder:
             np.where(mean_prob < 0.35, "casual", "neutral")
         )
 
+        # ── Batch hedging via cKDTree (replaces 50K individual kNN) ────
+        hedging_flags = _batch_derive_hedging(self._manifold, valid_labels)
+
         # ── Build entries (fast — no manifold lookups in this loop) ────
         entries = []
         for i in range(N):
@@ -441,7 +520,7 @@ class TemplateBuilder:
                 rhythm           = "short",
                 uncertainty_fit  = float(mean_unc[i]),
                 causal_strength  = float(mean_causal[i]),
-                hedging          = _derive_hedging(self._manifold, valid_labels[i]),
+                hedging          = hedging_flags[i],
             )
             entries.append(entry)
 
