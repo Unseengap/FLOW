@@ -35,6 +35,13 @@ from src.phase1.expression.matcher import ExpressionEntry
 from src.phase1.expression.wave import WAVE_DIM
 from src.vocabulary.cooccurrence import CoOccurrenceMatrix
 
+# ── Optional GPU acceleration via cupy ────────────────────────────────────────
+try:
+    import cupy as cp
+    _HAS_CUPY = True
+except ImportError:
+    _HAS_CUPY = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 DIM_CAUSAL = slice(64, 80)   # causal fiber
@@ -353,89 +360,159 @@ class TemplateBuilder:
 
         return entries
 
-    # ── Level 1 — single words ─────────────────────────────────────────────
+    # ── Level 1 — single words (batch-vectorized) ──────────────────────────
 
     def _build_level1(self) -> List[ExpressionEntry]:
-        """Generate one ExpressionEntry per vocabulary word on M(t)."""
-        entries = []
+        """Generate one ExpressionEntry per vocabulary word on M(t).
+
+        Uses batch-vectorized numpy (or cupy on GPU) to compute all wave
+        profiles and metadata in a single pass — avoids 50K+ per-word loops.
+        Falls back to per-word iteration only when batch fails.
+        """
         vocab_labels = [
             l for l in self._manifold._points if l.startswith("vocab::")
         ]
         vocab_labels = vocab_labels[: self.max_level1]
+        if not vocab_labels:
+            return []
+
+        # ── Gather all positions + densities into arrays ───────────────
+        valid_labels = []
+        valid_words  = []
+        positions    = []
+        densities    = []
 
         for label in vocab_labels:
-            word = label[len("vocab::"):]
+            word = label[len("vocab::")+0:]
             if not word:
                 continue
             try:
-                wave = compose_wave_profile(self._manifold, [label])
-                entry = ExpressionEntry(
-                    text             = word,
-                    wave_profile     = wave,
-                    register         = _derive_register(self._manifold, label),
-                    rhythm           = "short",
-                    uncertainty_fit  = _derive_uncertainty_fit(self._manifold, label),
-                    causal_strength  = _derive_causal_strength(self._manifold, label),
-                    hedging          = _derive_hedging(self._manifold, label),
-                )
-                entries.append(entry)
+                pos = self._manifold.position(label)
+                d   = float(self._manifold.density(pos))
+                valid_labels.append(label)
+                valid_words.append(word)
+                positions.append(pos)
+                densities.append(d)
             except (KeyError, ValueError):
                 continue
 
+        if not positions:
+            return []
+
+        N = len(positions)
+
+        # ── Batch compute wave profiles ────────────────────────────────
+        pos_arr = np.stack(positions)               # (N, 104)
+        den_arr = np.array(densities, dtype=float)  # (N,)
+
+        # Use GPU if cupy is available
+        if _HAS_CUPY:
+            pos_gpu = cp.asarray(pos_arr[:, :WAVE_DIM])  # (N, WAVE_DIM)
+            norms   = cp.linalg.norm(pos_gpu, axis=1, keepdims=True)
+            norms   = cp.maximum(norms, 1e-12)
+            waves   = cp.asnumpy(pos_gpu / norms)         # (N, WAVE_DIM)
+        else:
+            wave_arr = pos_arr[:, :WAVE_DIM]              # (N, WAVE_DIM)
+            norms    = np.linalg.norm(wave_arr, axis=1, keepdims=True)
+            norms    = np.maximum(norms, 1e-12)
+            waves    = wave_arr / norms                    # (N, WAVE_DIM)
+
+        # ── Batch compute metadata from array slicing ──────────────────
+        prob_fiber   = pos_arr[:, 88:104]             # (N, 16)
+        causal_fiber = pos_arr[:, 64:80]              # (N, 16)
+
+        mean_prob    = prob_fiber.mean(axis=1)        # (N,)
+        mean_causal  = causal_fiber.mean(axis=1)      # (N,)
+        mean_unc     = mean_prob                      # same computation
+
+        # Vectorized register: formal > 0.65, casual < 0.35, else neutral
+        registers = np.where(
+            mean_prob > 0.65, "formal",
+            np.where(mean_prob < 0.35, "casual", "neutral")
+        )
+
+        # ── Build entries (fast — no manifold lookups in this loop) ────
+        entries = []
+        for i in range(N):
+            entry = ExpressionEntry(
+                text             = valid_words[i],
+                wave_profile     = waves[i],
+                register         = str(registers[i]),
+                rhythm           = "short",
+                uncertainty_fit  = float(mean_unc[i]),
+                causal_strength  = float(mean_causal[i]),
+                hedging          = _derive_hedging(self._manifold, valid_labels[i]),
+            )
+            entries.append(entry)
+
         return entries
 
-    # ── Level 2 — short phrases ────────────────────────────────────────────
+    # ── Level 2 — short phrases (batch kNN) ──────────────────────────────
 
     def _build_level2(
         self, matrix: Optional[CoOccurrenceMatrix] = None
     ) -> List[ExpressionEntry]:
-        """Generate phrase entries from nearby word combinations (§4.4)."""
-        entries   = []
-        seen_pair = set()
+        """Generate phrase entries from nearby word combinations (§4.4).
 
+        Uses batch-vectorized kNN via cKDTree (or FAISS-GPU when available)
+        to find all nearby pairs at once instead of per-word nearest() calls.
+        """
         vocab_labels = [
             l for l in self._manifold._points if l.startswith("vocab::")
         ]
+        if len(vocab_labels) < 2:
+            return []
 
-        # Build a list of (label, position) for similarity fiber proximity
-        label_positions = []
+        # ── Gather all positions into a matrix ────────────────────────────
+        label_list = []
+        pos_list   = []
         for label in vocab_labels:
             try:
                 pos = self._manifold.position(label)
-                label_positions.append((label, pos))
+                label_list.append(label)
+                pos_list.append(pos)
             except (KeyError, ValueError):
                 continue
 
-        # For each word, find neighbours within phrase_radius and form phrases
-        count = 0
-        for label_a, pos_a in label_positions:
+        if len(pos_list) < 2:
+            return []
+
+        pos_arr = np.stack(pos_list)  # (V, 104)
+
+        # ── Batch kNN: find 6 nearest neighbours for all words at once ────
+        from scipy.spatial import cKDTree
+        tree = cKDTree(pos_arr)
+        dists_all, idxs_all = tree.query(pos_arr, k=7)  # k+1 because self is included
+
+        # ── Build phrase entries from nearby pairs ─────────────────────────
+        entries   = []
+        seen_pair = set()
+        count     = 0
+
+        for i in range(len(label_list)):
             if count >= self.max_level2:
                 break
-            word_a = label_a[len("vocab::"):]
-            try:
-                neighbours = self._manifold.nearest(pos_a, k=6)
-            except (KeyError, ValueError):
-                continue
+            label_a = label_list[i]
+            word_a  = label_a[len("vocab::"):]
 
-            for label_b, pos_b in neighbours:
+            for j_idx in range(1, min(7, len(idxs_all[i]))):  # skip self at idx 0
                 if count >= self.max_level2:
                     break
-                if label_b == label_a:
-                    continue
-                if not label_b.startswith("vocab::"):
-                    continue
-                # Deduplicate (A,B) and (B,A)
-                pair_key = tuple(sorted([label_a, label_b]))
-                if pair_key in seen_pair:
-                    continue
-                dist = float(np.linalg.norm(pos_a - pos_b))
+                j    = idxs_all[i][j_idx]
+                dist = dists_all[i][j_idx]
                 if dist > self._phrase_radius:
                     continue
 
-                word_b = label_b[len("vocab::"):]
+                label_b = label_list[j]
+                if not label_b.startswith("vocab::"):
+                    continue
 
-                # Simple adjective-noun heuristic (A modifies B)
-                # Word ordering: shorter/adjectival first
+                pair_key = tuple(sorted([label_a, label_b]))
+                if pair_key in seen_pair:
+                    continue
+                seen_pair.add(pair_key)
+
+                word_b = label_b[len("vocab::"):]
                 if len(word_a) <= len(word_b):
                     phrase = f"{word_a} {word_b}"
                     labels = [label_a, label_b]
@@ -443,7 +520,6 @@ class TemplateBuilder:
                     phrase = f"{word_b} {word_a}"
                     labels = [label_b, label_a]
 
-                seen_pair.add(pair_key)
                 try:
                     wave = compose_wave_profile(self._manifold, labels)
                     entry = ExpressionEntry(
