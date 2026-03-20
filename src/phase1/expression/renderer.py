@@ -47,6 +47,13 @@ import numpy as np
 from .wave import StandingWave, WaveSegment, WavePoint
 from .matcher import ResonanceMatcher, MatchResult
 
+# Optional: Phase 10 Geometric Grammar Engine
+try:
+    from src.phase10.grammar.grammar_renderer import GrammarRenderer as _GrammarRenderer
+    _HAS_GRAMMAR = True
+except ImportError:
+    _HAS_GRAMMAR = False
+
 
 # ── Output type ────────────────────────────────────────────────────────────
 
@@ -97,9 +104,12 @@ class ExpressionRenderer:
     To render into a different language, swap the matcher's vocabulary.
     """
 
-    def __init__(self, dim: int = 104) -> None:
+    def __init__(self, dim: int = 104, use_grammar: bool = True) -> None:
         self.matcher = ResonanceMatcher(dim=dim)
         self.dim     = dim
+        self._grammar = None
+        if use_grammar and _HAS_GRAMMAR:
+            self._grammar = _GrammarRenderer()
 
     # ------------------------------------------------------------------ #
     # Public API                                                            #
@@ -135,6 +145,12 @@ class ExpressionRenderer:
 
         # ── Stage 3: Flow preservation ────────────────────────────────
         sentences, diagnostics = self._apply_flow_preservation(segments, matches)
+
+        # ── Stage 3b: Grammar-enhanced rendering (Phase 10) ───────────
+        if self._grammar is not None:
+            sentences, diagnostics = self._grammar_enhance(
+                segments, matches, sentences, diagnostics
+            )
 
         # ── Assemble final text ───────────────────────────────────────
         text = self._assemble(sentences, segments)
@@ -584,3 +600,85 @@ class ExpressionRenderer:
         if s and s[-1] not in ".!?":
             s += "."
         return s
+
+    # ------------------------------------------------------------------ #
+    # Stage 3b — Grammar-enhanced rendering (Phase 10)                     #
+    # ------------------------------------------------------------------ #
+
+    def _grammar_enhance(
+        self,
+        segments: List[WaveSegment],
+        matches: List[MatchResult],
+        template_sentences: List[str],
+        template_diagnostics: List[dict],
+    ) -> tuple[List[str], List[dict]]:
+        """Attempt grammar-enhanced rendering for segments with rich data.
+
+        For each segment, if it has ≥2 labelled wave points, the grammar
+        engine composes a sentence from S-V-O role assignments derived
+        from the 104D geometry.  Otherwise, the template sentence is kept.
+
+        Parameters
+        ----------
+        segments            : wave segments from Stage 1
+        matches             : template matches from Stage 2
+        template_sentences  : sentences from template Stage 3
+        template_diagnostics: diagnostics from template Stage 3
+
+        Returns
+        -------
+        (enhanced_sentences, enhanced_diagnostics)
+        """
+        enhanced_sentences: List[str] = []
+        enhanced_diagnostics: List[dict] = []
+
+        for i, seg in enumerate(segments):
+            labelled_points = [p for p in seg.points if p.label]
+
+            # Need ≥ 2 labelled concepts for compositional grammar
+            if len(labelled_points) < 2:
+                # Keep template output
+                if i < len(template_sentences):
+                    enhanced_sentences.append(template_sentences[i])
+                    enhanced_diagnostics.append(
+                        template_diagnostics[i] if i < len(template_diagnostics) else {}
+                    )
+                continue
+
+            # Attempt grammar rendering
+            try:
+                vectors = [p.vector for p in labelled_points]
+                labels = [p.label for p in labelled_points]
+                amplitudes = [p.amplitude for p in labelled_points]
+                taus = [p.tau for p in labelled_points]
+
+                result = self._grammar.render_segment(
+                    vectors=vectors,
+                    labels=labels,
+                    amplitudes=amplitudes,
+                    taus=taus,
+                    flow_speed=seg.flow_speed,
+                    coherence=seg.coherence,
+                    uncertainty=seg.uncertainty,
+                )
+
+                if result.text and len(result.text) > 5:
+                    enhanced_sentences.append(result.text)
+                    diag = template_diagnostics[i].copy() if i < len(template_diagnostics) else {}
+                    diag["grammar_enhanced"] = True
+                    diag["grammar_complexity"] = result.complexity
+                    diag["grammar_tense"] = result.tense
+                    diag["grammar_confidence"] = result.confidence
+                    enhanced_diagnostics.append(diag)
+                    continue
+            except Exception:
+                pass  # fall through to template
+
+            # Fallback: keep template output
+            if i < len(template_sentences):
+                enhanced_sentences.append(template_sentences[i])
+                enhanced_diagnostics.append(
+                    template_diagnostics[i] if i < len(template_diagnostics) else {}
+                )
+
+        return enhanced_sentences, enhanced_diagnostics
