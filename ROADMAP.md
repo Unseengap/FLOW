@@ -6,17 +6,17 @@
 
 ---
 
-## Current State (Phase 8 Complete)
+## Current State (Phase 10 Complete)
 
 | Metric | Value |
 |---|---|
 | Manifold concepts | 10,081 (81 seed + 10K vocabulary) |
 | Vocabulary entries | ~10,000 (Level 1 + 2 + 3) |
 | Manifold dimension | 104D (64 similarity + 16 causal + 8 logical + 16 probabilistic) |
-| Output quality | Template-based, 1–3 sentences per query |
+| Output quality | Grammar Engine (C7b) — compositional syntax from manifold geometry |
 | Inference latency | ~50ms per query (CPU) |
 | Total system size | ~8 MB |
-| Tests passing | 722/722 (1 optional FAISS skip) |
+| Tests passing | 837/837 (1 optional FAISS skip) |
 | Training cost | Zero |
 
 ---
@@ -55,7 +55,7 @@ Production serving estimated at ~$0.60/hour (CPU). LLaMA-70B inference ≈ $5–
 
 | Capability | LLM Mechanism | FLOW Current State | Gap Severity |
 |---|---|---|---|
-| Fluent, varied syntax | Autoregressive token prediction | 32 hand-crafted templates + slot filling | **Critical** |
+| Fluent, varied syntax | Autoregressive token prediction | Geometric Grammar Engine (C7b) — S-V-O from causal fiber, tense from τ-offset, morphology inflection | **Reduced** (Phase 10 ✅) |
 | Multi-paragraph output | Unlimited token generation | Single trajectory → 1–3 sentences | **Critical** |
 | Compositional meaning | Attention composes across positions | Words are independent 104D points | **High** |
 | Selective focus | Multi-head attention weighs context | Isotropic Gaussian excitation (all directions equal) | **High** |
@@ -72,37 +72,20 @@ Production serving estimated at ~$0.60/hour (CPU). LLaMA-70B inference ≈ $5–
 **New code:** ~6,000 lines  
 **Goal:** Match or exceed GPT-2 Small on output quality while maintaining all structural advantages  
 
-### 1.1 Geometric Grammar Engine (C7b) — THE critical component
+### 1.1 Geometric Grammar Engine (C7b) — COMPLETED ✅ (Phase 10)
 
-**What it does:** Replaces template-based rendering with compositional syntax derived from manifold geometry.
+**Implemented in:** `src/phase10/grammar/` — 5 modules, 116 tests, auto-wired into C7  
+**See:** `Phase-10_completed.md` for full details
 
-**Current problem:** C7 has 32 templates like `"This happens because {}."` Output reads like Mad Libs regardless of vocabulary size.
-
-**Solution — Grammar as Geometry:**
-
-```
-Syntax rules encoded as geometric operations on the causal fiber:
-
-  Subject → Verb:     causal_direction(subject_pos, verb_pos) > 0
-  Verb → Object:      causal_direction(verb_pos, object_pos) > 0
-  Modifier → Head:    distance(modifier_pos, head_pos) < phrase_radius
-  Main → Subordinate: fiber_section(main) contains fiber_section(sub)
-```
-
-**Implementation plan:**
-
-| Sub-component | Lines | What it does |
+| Sub-component | Lines | Status |
 |---|---|---|
-| `SyntaxGeometry` | ~600 | Encodes S-V-O ordering, agreement, tense via causal fiber operations |
-| `ClauseComposer` | ~800 | Composes main + subordinate clauses via fiber bundle sections |
-| `MorphologyMap` | ~400 | Maps word families ("run"/"running"/"ran") as geometric clusters with systematic fiber offsets |
-| `GrammarRenderer` | ~700 | Replaces template slot-filling with compositional sentence construction |
-| `AgreementChecker` | ~300 | Number/gender/tense agreement as manifold distance constraints |
-| Integration + tests | ~200 | Wire into existing C7 pipeline |
+| `SyntaxGeometry` | ~280 | ✅ S-V-O roles from causal fiber direction |
+| `ClauseComposer` | ~320 | ✅ Clause composition via fiber bundle sections |
+| `MorphologyMap` | ~380 | ✅ 27 irregular verbs, 15 irregular plurals, English phonological rules |
+| `GrammarRenderer` | ~400 | ✅ Compositional sentence construction replaces template slot-filling |
+| `AgreementChecker` | ~200 | ✅ Number/tense agreement as logical fiber distance constraints |
 
-**Result:** Output like `"The perturbation mechanism drives co-occurrence patterns, which in turn reshape the underlying causal structure."` instead of `"The mechanism is: perturbation. This leads directly to co occurrence."`
-
-**How this beats GPT-2:** GPT-2 Small has only 12 attention layers — its syntax is often repetitive and loses coherence after a few sentences. FLOW's grammar geometry produces structurally correct syntax from mathematical constraints, not statistical approximation.
+**Result:** Grammar derived entirely from 104D manifold geometry — S-V-O ordering from causal fiber direction, tense from τ-offset, number agreement from logical fiber, morphological class from similarity quadrant energy. Auto-wires via `ExpressionRenderer(use_grammar=True)` which is the default.
 
 ### 1.2 Vocabulary Scale-Up to 200K
 
