@@ -261,7 +261,7 @@ HuggingFace's `transformers` pipeline API assumes tokenizer + model forward pass
 
 ```python
 # ── Kaggle Notebook Cell 1: Install ──────────────────────────────
-!git clone https://github.com/yourname/FLOW.git
+!git clone https://github.com/Unseengap/FLOW
 !pip install numpy scipy networkx
 
 # ── Cell 2: Build pipeline + feed corpus ──────────────────────────
