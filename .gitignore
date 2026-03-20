@@ -33,6 +33,13 @@ Thumbs.db
 !models/
 !models/*.npz
 
+# Checkpoint caches (large binary files, not for version control)
+checkpoints/*.pkl
+checkpoints/*.npz
+# BUT keep checkpoint JSON markers
+!checkpoints/
+!checkpoints/*.json
+
 # FAISS indices
 *.faiss
 
