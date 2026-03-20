@@ -29,6 +29,9 @@ Thumbs.db
 
 # Persistence artifacts (local snapshots)
 *.npz
+# BUT keep saved models in models/
+!models/
+!models/*.npz
 
 # FAISS indices
 *.faiss

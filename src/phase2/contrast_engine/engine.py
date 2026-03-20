@@ -122,6 +122,7 @@ class ContrastEngine:
         self._diagram = PersistenceDiagram()
         self._n_judgments: int = 0
         self._history: List[ContrastResult] = []
+        self._applying_corrections: bool = False
 
     # ------------------------------------------------------------------ #
     # Core operation                                                       #
@@ -181,7 +182,10 @@ class ContrastEngine:
         self._history.append(result)
         self._n_judgments += 1
 
-        if self._n_judgments % self.correction_interval == 0:
+        if (
+            self._n_judgments % self.correction_interval == 0
+            and not self._applying_corrections
+        ):
             self.apply_structural_corrections()
 
         return result
@@ -300,6 +304,13 @@ class ContrastEngine:
 
         Returns the number of corrections applied.
         """
+        self._applying_corrections = True
+        try:
+            return self._apply_corrections_inner(min_lifetime)
+        finally:
+            self._applying_corrections = False
+
+    def _apply_corrections_inner(self, min_lifetime: float) -> int:
         corrections = self._diagram.cluster_corrections(min_lifetime)
         applied = 0
         for corr in corrections:
